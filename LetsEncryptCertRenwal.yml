@@ -27,7 +27,7 @@
       shell: |
         git config --global user.email "ansible_certadmin@donotreply.com"
         git config --global user.name "Ansible certificate agent"
-        git clone "https://{{ gitlab_username | urlencode }}:{{ gitlab_password | urlencode }}@gitlab.presidio.com/automation-lab-demos/{{ gitlab_username | urlencode }}.git" {{files_loc}}
+        git clone "https://github.com/PresidioCapedCoder/cert-store.git" {{files_loc}}
       delegate_to: localhost
       run_once: true
 
