@@ -1,0 +1,179 @@
+---
+#------------------------------------------------------------------------------
+#---- Create LetsEncrypt certificate for domains listed in cert_list.txt
+#------------------------------------------------------------------------------
+- name: create Letsencrypt cert
+  hosts: localhost
+  gather_facts: false
+  
+  #------------------------------------------------------------------------------
+  #----  files_loc: Directory path to store keys and certificates.
+  #----  le_private_key: Path to the Let's Encrypt account key.
+  #----  email: Email used for Cloudflare API.
+  #------------------------------------------------------------------------------
+  vars:
+    files_loc: ~/cert-store
+    le_private_key: "{{ files_loc }}/le-account.key"
+    email: "{{ email }}"
+  
+  tasks:
+    #------------------------------------------------------------------------------
+    #----  Clone the Git repository containing the latest certificates.
+    #----  This uses shell commands to set Git config and clone the repository.
+    #----  delegate_to: localhost - Ensures this runs on the Ansible control node.
+    #----  run_once: true - Ensures this task is executed only once.
+    #------------------------------------------------------------------------------
+    - name: Clone the git repo with current certificates
+      shell: |
+        git config --global user.email "ansible_certadmin@donotreply.com"
+        git config --global user.name "Ansible certificate agent"
+        git clone "https://{{ gitlab_username | urlencode }}:{{ gitlab_password | urlencode }}@gitlab.presidio.com/automation-lab-demos/{{ gitlab_username | urlencode }}.git" {{files_loc}}
+      delegate_to: localhost
+      run_once: true
+
+    #------------------------------------------------------------------------------
+    #---- Initialize an empty list to store certificate information
+    #------------------------------------------------------------------------------
+    - name: Create cert list
+      set_fact:
+        certlist: []
+
+    #------------------------------------------------------------------------------
+    #---- Populate the certlist with domain names from cert_list.txt
+    #------------------------------------------------------------------------------
+    - name: Append Certs to list
+      set_fact:
+        certlist:  "{{ certlist + [ item ] }}"
+      with_lines: "cat {{ files_loc }}/cert_list.txt"
+
+    #------------------------------------------------------------------------------
+    #---- Debug: Print the certlist to the console
+    #------------------------------------------------------------------------------
+    - name: debug certlist
+      debug:
+        var: certlist
+
+    #------------------------------------------------------------------------------
+    #---- Ensure that the LetsEncrypt account exists and is up-to-date
+    #------------------------------------------------------------------------------
+    - name: Make sure account exists and has given contacts. We agree to TOS.
+      community.crypto.acme_account:
+        account_key_src: "{{ le_private_key }}"
+        state: present
+        terms_agreed: yes
+        acme_version: 2
+        acme_directory: https://acme-v02.api.letsencrypt.org/directory
+        contact:
+        - "mailto:nomail@{{ item.split('.')[1]}}.{{item.split('.')[2] }}"
+      loop: "{{ certlist }}"
+
+    #------------------------------------------------------------------------------
+    #---- Generate Certificate Signing Requests (CSR) for each domain
+    #------------------------------------------------------------------------------
+    - name: Generate an OpenSSL Certificate Signing Request
+      community.crypto.openssl_csr:
+        path: "{{ files_loc }}/{{ item }}/{{ item }}.csr"
+        privatekey_path: "{{ files_loc }}/{{ item }}/{{ item }}.key"
+        common_name: "{{ item }}" 
+      loop: "{{ certlist }}" # Loop through each domain in certlist
+
+    #------------------------------------------------------------------------------
+    #---- Create challenges for LetsEncrypt verification
+    #------------------------------------------------------------------------------
+    - name: Create a challenge using an account key file.
+      community.crypto.acme_certificate:
+        account_key_src: "{{ le_private_key }}"
+        account_email: "{{ email }}"
+        src: "{{ files_loc }}/{{ item }}/{{ item }}.csr"
+        cert: "{{ files_loc }}/{{ item }}/{{ item }}.crt"
+        challenge: dns-01
+        acme_directory: https://acme-v02.api.letsencrypt.org/directory
+        remaining_days: 60
+        acme_version: 2
+      loop: "{{ certlist }}"
+      register: com_challenge
+
+    #------------------------------------------------------------------------------
+    #---- Debug: Print the com_challenge results to the console
+    #------------------------------------------------------------------------------
+    - name: debug com_challenge
+      debug:
+        var: com_challenge.results
+
+    #------------------------------------------------------------------------------
+    #---- Create TXT records on Cloudflare for DNS-01 challenge
+    #------------------------------------------------------------------------------
+    - name: Create an TXT record on cloudflare when the record file exists
+      community.general.cloudflare_dns:
+        zone: "{{ item.1.split('.')[1]}}.{{item.1.split('.')[2] }}" # Extract domain parts for zone
+        record: "{{ item.0.challenge_data[item.1]['dns-01'].record }}" # Retrieve challenge record for each domain
+        value: "{{ item.0.challenge_data[item.1]['dns-01'].resource_value }}" # Retrieve challenge value for each domain
+        type: TXT
+        account_email: "{{ email }}"
+        account_api_key: "{{ API_key }}"
+      when: item.0.challenge_data[item.1]['dns-01'].record is defined # Only run when challenge record is defined
+      loop: "{{ com_challenge.results | zip(certlist) | list }}" # Loop through all challenges and associated domains
+      register: record
+
+    #------------------------------------------------------------------------------
+    #---- Wait for TXT entry to propagate through DNS
+    #------------------------------------------------------------------------------
+    - name: Wait for TXT entry to appear
+      community.dns.wait_for_txt:
+        records:
+          - name: "{{ item.0.challenge_data[item.1]['dns-01'].record }}"
+            values: "{{ item.0.challenge_data[item.1]['dns-01'].resource_value }}"
+            mode: equals
+        always_ask_default_resolver: false
+        timeout: 120
+      when: item.0.challenge_data[item.1]['dns-01'].record is defined
+      loop: "{{ com_challenge.results | zip(certlist) | list }}"
+
+    #------------------------------------------------------------------------------
+    #---- Fetch and store the newly verified LetsEncrypt certificates
+    #------------------------------------------------------------------------------
+    - name: Let the challenge be validated and retrieve the cert and intermediate certificate - retry multiple times because the DNS can be a little slow
+      community.crypto.acme_certificate:
+        account_key_src: "{{ le_private_key }}"
+        account_email: "{{ email }}"
+        src: "{{ files_loc }}/{{ item.1 }}/{{ item.1 }}.csr"
+        cert: "{{ files_loc }}/{{ item.1 }}/{{ item.1 }}.crt"
+        fullchain: "{{ files_loc }}/{{ item.1 }}/{{ item.1 }}-fullchain.crt"
+        chain: "{{ files_loc }}/{{ item.1 }}/{{ item.1 }}-intermediate.crt"
+        challenge: dns-01
+        remaining_days: 60
+        data: "{{ item.0 }}"
+        acme_directory: https://acme-v02.api.letsencrypt.org/directory
+        acme_version: 2
+      when: com_challenge is changed
+      register: lsresult
+      until: "lsresult is not failed"
+      retries: 12
+      delay: 10
+      loop: "{{ com_challenge.results | zip(certlist) | list }}"
+
+    #------------------------------------------------------------------------------
+    #---- Cleanup: Remove the TXT records from Cloudflare
+    #------------------------------------------------------------------------------
+    - name: Remove TXT record from cloudflare after domain is verified
+      community.general.cloudflare_dns:
+        zone: "{{ item.1.split('.')[1]}}.{{item.1.split('.')[2] }}"
+        record: "{{ item.0.challenge_data[item.1]['dns-01'].record }}"
+        value: "{{ item.0.challenge_data[item.1]['dns-01'].resource_value }}"
+        type: TXT
+        account_email: "{{ email }}"
+        account_api_key: "{{ API_key }}"
+        state: absent
+      when: (com_challenge is changed) and (com_challenge is defined) and (challenge_data is defined)
+      loop: "{{ com_challenge.results | zip(certlist) | list }}"
+
+    #------------------------------------------------------------------------------
+    #---- Commit the new certificates to the Git repository
+    #------------------------------------------------------------------------------
+    - name: Commit changes to git repo
+      shell: |
+        cd {{ files_loc }}
+        git add *
+        git commit -am "Cert Renewal"
+        git push
+      run_once: true
