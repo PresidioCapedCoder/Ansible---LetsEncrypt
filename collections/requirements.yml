@@ -1,0 +1,6 @@
+collections:
+# Install collections
+- cisco.asa
+- community.crypto
+- community.general
+- community.dns
