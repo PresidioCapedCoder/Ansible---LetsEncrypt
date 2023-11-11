@@ -1,0 +1,86 @@
+---
+- name: Cert Management on ASA
+  hosts: platforms_cisco-asa
+  become: true
+  become_method: enable
+  gather_facts: false
+  vars:
+    #------------------------------------------------------------------------------
+    #---- Set the location for storing keys and certificates.
+    #---- files_loc: The directory where the certificates and keys will be stored.
+    #---- vpn_cert: Variable for the certificate URL, passed as an extra var.
+    #---- p12_password: Password for the PKCS#12 certificate, passed as an extra var.
+    #---- trustpoint_name: The name of the trustpoint to be used in ASA.
+    #------------------------------------------------------------------------------
+    files_loc: ~/cert-store
+    vpn_cert: "{{ Cert_URL }}"
+    p12_password: "{{ Cert_PW }}"
+    trustpoint_name: "RAVPN"
+  tasks:
+    #------------------------------------------------------------------------------
+    #---- Clone the Git repository containing the latest certificates.
+    #---- This uses shell commands to set Git config and clone the repository.
+    #---- delegate_to: localhost - Ensures this runs on the Ansible control node.
+    #---- run_once: true - Ensures this task is executed only once.
+    #------------------------------------------------------------------------------
+  - name: Clone the git repo with current certificates
+    shell: |
+      git config --global user.email "ansible_certadmin@donotreply.com"
+      git config --global user.name "Ansible certificate agent"
+      git clone "https://{{ gitlab_username | urlencode }}:{{ gitlab_password | urlencode }}@gitlab.presidio.com/automation-lab-demos/{{ gitlab_username | urlencode }}.git" {{files_loc}} 
+    delegate_to: localhost
+    run_once: true
+
+    #------------------------------------------------------------------------------
+    #---- Convert the certificate to PKCS#12 format.
+    #---- This task uses the community.crypto.openssl_pkcs12 module to create a PKCS#12 file.
+    #---- delegate_to: localhost - Runs the task on the Ansible control node.
+    #------------------------------------------------------------------------------
+  - name: Convert certificate to PKCS#12 format
+    community.crypto.openssl_pkcs12:
+      action: export
+      path: "{{ files_loc }}/{{ vpn_cert }}/{{ vpn_cert }}.p12"
+      privatekey_path: "{{ files_loc }}/{{ vpn_cert }}/{{ vpn_cert }}.key"
+      certificate_path: "{{ files_loc }}/{{ vpn_cert }}/{{ vpn_cert }}.crt"
+      friendly_name: "{{ vpn_cert }}"
+      passphrase: "{{ p12_password }}"
+    delegate_to: localhost
+
+    #------------------------------------------------------------------------------
+    #---- Read and encode the PKCS#12 file in base64 format.
+    #---- The cert is split into manageable lines for easier transfer to the ASA.
+    #------------------------------------------------------------------------------
+  - name: Get Certificate
+    set_fact:
+      cert: >
+        {{ (lookup('file', '/runner/cert-store/{{ vpn_cert }}/{{ vpn_cert }}.p12') | b64encode | regex_replace('(.{1,64})', '\1|')).split('|') | select('string') | reject('match', '^$') | list + ['quit'] }}
+    tags: [ cert ]
+
+    #------------------------------------------------------------------------------
+    #---- Import the PKCS#12 file using the defined trustpoint.
+    #---- asa_config: Used for configuring the Cisco ASA device.
+    #---- parents: Specifies the parent command under which lines are entered.
+    #---- lines: The base64 encoded certificate split into parts for import.
+    #---- notify: Calls the handler to assign the trustpoint to the SSL interface.
+    #------------------------------------------------------------------------------
+  - name: Import PKCS12 using trustpoint
+    asa_config:
+      replace: block
+      parents: "crypto ca import {{ trustpoint_name }} pkcs12 {{ p12_password }} nointeractive"
+      lines: "{{ cert }}"
+    notify:
+      - Assign the Trustpoint to the SSL Interface
+
+  handlers:
+    #------------------------------------------------------------------------------
+    #---- Handler to assign the imported trustpoint to the SSL interface.
+    #---- cisco.asa.asa_config: Module for configuring Cisco ASA.
+    #---- save: true - Saves the configuration on the ASA.
+    #---- lines: Command to assign the trustpoint to the 'outside' interface.
+    #------------------------------------------------------------------------------ 
+  - name: Assign the Trustpoint to the SSL Interface
+    cisco.asa.asa_config:
+      save: true
+      lines:
+        - "ssl trust-point {{ trustpoint_name }} outside"
+    register: assign_trustpoint
