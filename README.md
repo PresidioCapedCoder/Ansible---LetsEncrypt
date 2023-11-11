@@ -80,7 +80,3 @@ When running playbooks that use variables stored in an encrypted file, you have 
 - **Security**: Keep the Vault password and any password files secure.
 - **Version Control**: You can commit the encrypted file (`vault_vars.yml`) to version control safely, but never the plaintext password or the password file.
 - **Multiple Vaults**: Consider using different vault files for different environments (e.g., staging vs production) or different types of secrets.
-
----
-
-This section should provide a clear understanding of how to integrate Ansible Vault into your use of these playbooks. Make sure to follow security best practices when handling sensitive data.
