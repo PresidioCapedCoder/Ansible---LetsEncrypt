@@ -1,0 +1,251 @@
+---
+- name: create Letsencrypt cert
+  hosts: localhost
+  gather_facts: false
+  vars:
+
+    #------------------------------------------------------------------------------
+    #----  files_loc: Directory path to store keys and certificates.
+    #----  le_private_key: Path to the Let's Encrypt account key.
+    #----  csr_private_key: Path to the Certificate Signing Request (CSR) private key.
+    #----  email: Email used for Cloudflare API.
+    #----  dns_zone: Extracted parent domain for the certificate.
+    #------------------------------------------------------------------------------
+    files_loc: ~/cert-store
+    le_private_key: "{{ files_loc }}/le-account.key"
+    csr_private_key: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}.key"
+    email: dkhenderson2@gmail.com
+    dns_zone: "{{ fqdn.split('.')[1] }}.{{ fqdn.split('.')[2] }}"
+
+  tasks:
+
+    #------------------------------------------------------------------------------
+    #----  Clone the Git repository containing the latest certificates.
+    #----  This uses shell commands to set Git config and clone the repository.
+    #----  delegate_to: localhost - Ensures this runs on the Ansible control node.
+    #----  run_once: true - Ensures this task is executed only once.
+    #------------------------------------------------------------------------------
+  - name: Clone the git repo with current certificates
+    shell: |
+      git config --global user.email "ansible_certs@donotreply.com"
+      git config --global user.name "Ansible certificate agent"
+      git clone "https://{{ gitlab_username | urlencode }}:{{ gitlab_password | urlencode }}@gitlab.presidio.com/automation-lab-demos/{{ gitlab_username | urlencode }}.git" {{files_loc}} 
+    delegate_to: localhost
+    run_once: true
+
+    #------------------------------------------------------------------------------
+    #----  Creates a directory for storing specific certificate files.
+    #------------------------------------------------------------------------------
+  - name: Create directory for certs directory
+    file:
+      path: "{{ files_loc }}/{{ fqdn }}"
+      state: directory
+
+    #------------------------------------------------------------------------------
+    #----  Adds the fully qualified domain name (FQDN) to a list of certificates.
+    #------------------------------------------------------------------------------
+  - name: Add Cert name to list
+    ansible.builtin.lineinfile:
+      path: "{{ files_loc }}/cert_list.txt"
+      regexp: '^{{ fqdn }}'
+      line: "{{ fqdn }}"
+
+    #------------------------------------------------------------------------------
+    #----  Generates a private key for Let's Encrypt.
+    #------------------------------------------------------------------------------
+  - name: Generate Letsencrypt private key
+    openssl_privatekey:
+      path: "{{ le_private_key }}"
+      state: present
+
+    #------------------------------------------------------------------------------
+    #----  Generates a CSR private key for the specific site.
+    #------------------------------------------------------------------------------
+  - name: Generate CSR private key
+    openssl_privatekey:
+      path: "{{ csr_private_key }}"
+      state: present
+
+    #------------------------------------------------------------------------------
+    #----  Ensures that the Let's Encrypt account exists and agrees to terms of service.
+    #------------------------------------------------------------------------------
+  - name: Make sure account exists and has given contacts. We agree to TOS.
+    community.crypto.acme_account:
+      validate_certs: false
+      account_key_src: "{{ le_private_key }}"
+      state: present
+      terms_agreed: yes
+      acme_version: 2
+      acme_directory: https://acme-v02.api.letsencrypt.org/directory
+      contact:
+      - "mailto:nomail@{{ dns_zone }}"
+
+    #------------------------------------------------------------------------------
+    #----  Generates an OpenSSL CSR.
+    #------------------------------------------------------------------------------
+  - name: Generate an OpenSSL Certificate Signing Request
+    community.crypto.openssl_csr:
+      path: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}.csr"
+      privatekey_path: "{{ csr_private_key }}"
+      common_name: "{{ fqdn }}"
+
+    #------------------------------------------------------------------------------
+    #----   Initiates the process to obtain a certificate via ACME (Let's Encrypt).
+    #------------------------------------------------------------------------------
+  - name: Create a challenge using an account key file.
+    community.crypto.acme_certificate:
+      validate_certs: false
+      account_key_src: "{{ le_private_key }}"
+      account_email: "{{ email }}"
+      src: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}.csr"
+      cert: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}.crt"
+      challenge: dns-01
+      acme_directory: https://acme-v02.api.letsencrypt.org/directory
+      #------------------------------------------------------------------------------
+      #----  Renew if the certificate is at least 30 days old
+      #------------------------------------------------------------------------------
+      remaining_days: 60
+      acme_version: 2
+    register: com_challenge
+
+    #------------------------------------------------------------------------------
+    #----   Debugging task to display the challenge information.
+    #------------------------------------------------------------------------------
+  - name: debug com_challenge
+    debug:
+      var: com_challenge
+
+    #------------------------------------------------------------------------------
+    #----   Finds the public IP address of the Ansible control node.
+    #------------------------------------------------------------------------------
+  - name: Find my public ip
+    uri: 
+      url: http://ifconfig.me/ip
+      return_content: yes
+    register: ip_address
+
+    #------------------------------------------------------------------------------
+    #----   Creates an A record in Cloudflare DNS for the FQDN pointing to the IP address.
+    #------------------------------------------------------------------------------
+  - name: Create an A record on cloudflare for FQDN
+    community.general.cloudflare_dns:
+      zone: "{{ dns_zone }}"
+      record: "{{ fqdn }}"
+      value: "{{ ip_address.content }}"
+      type: A
+      account_email: "{{ email }}"
+      account_api_key: "{{ API_key }}"
+    when: ip_address is defined
+
+    #------------------------------------------------------------------------------
+    #----   Creates a TXT record in Cloudflare for DNS challenge verification.
+    #------------------------------------------------------------------------------
+  - name: Create an TXT record on cloudflare when the record file exists
+    community.general.cloudflare_dns:
+      zone: "{{ dns_zone }}"
+      record: "{{ com_challenge.challenge_data[fqdn]['dns-01'].record }}"
+      value: "{{ com_challenge.challenge_data[fqdn]['dns-01'].resource_value }}"
+      type: TXT
+      account_email: "{{ email }}"
+      account_api_key: "{{ API_key }}"
+    when: com_challenge.challenge_data[fqdn]['dns-01'].record is defined
+    register: record
+
+    #------------------------------------------------------------------------------
+    #----   Waits for the TXT entry to appear in DNS, confirming propagation.
+    #------------------------------------------------------------------------------
+  - name: Wait for TXT entry to appear
+    community.dns.wait_for_txt:
+      records:
+        - name: "{{ com_challenge.challenge_data[fqdn]['dns-01'].record }}"
+          values: "{{ com_challenge.challenge_data[fqdn]['dns-01'].resource_value }}"
+          mode: equals
+      always_ask_default_resolver: false
+      timeout: 120
+
+    #------------------------------------------------------------------------------
+    #----  Retrieves the certificate and intermediate certificate after validation.
+    #----  Retries multiple times due to potential DNS propagation delays.
+    #------------------------------------------------------------------------------
+  - name: Let the challenge be validated and retrieve the cert and intermediate certificate - retry multiple times because the DNS can be a little slow
+    community.crypto.acme_certificate:
+      validate_certs: false
+      account_key_src: "{{ le_private_key }}"
+      account_email: "{{ email }}"
+      src: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}.csr"
+      cert: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}.crt"
+      fullchain: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}-fullchain.crt"
+      chain: "{{ files_loc }}/{{ fqdn }}/{{ fqdn }}-intermediate.crt"
+      challenge: dns-01
+      remaining_days: 60
+      data: "{{ com_challenge }}"
+      acme_directory: https://acme-v02.api.letsencrypt.org/directory
+      acme_version: 2
+    when: com_challenge is changed 
+    register: lsresult
+    until: "lsresult is not failed"
+    retries: 12
+    delay: 10
+
+    #------------------------------------------------------------------------------
+    #----  Removes the TXT record from Cloudflare DNS after domain verification.
+    #------------------------------------------------------------------------------
+  - name: Remove TXT record from cloudflare after domain is verified
+    community.general.cloudflare_dns:
+      zone: "{{ dns_zone }}"
+      record: "{{ com_challenge.challenge_data[fqdn]['dns-01'].record }}"
+      value: "{{ com_challenge.challenge_data[fqdn]['dns-01'].resource_value }}"
+      type: TXT
+      account_email: "{{ email }}"
+      account_api_key: "{{ API_key }}"
+      state: absent
+    when: com_challenge.challenge_data[fqdn]['dns-01'].record is defined
+
+    #------------------------------------------------------------------------------
+    #----  Commits the newly acquired certificates to the Git repository.
+    #------------------------------------------------------------------------------
+  - name: Commit changes to git repo
+    shell: |
+      cd {{ files_loc }}
+      git add *
+      git commit -am "New Cert added"
+      git push
+    run_once: true 
+
+    #------------------------------------------------------------------------------
+    #----  Updates a ServiceNow (SNOW) record about the certificate creation.
+    #------------------------------------------------------------------------------
+  - name: Update Request
+    snow_record:
+      state: present
+      table: sc_req_item
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      instance: "{{ sn_instance }}"
+      number: "{{ snow_item }}"
+      data:
+        work_notes: "Ansible Automation - Created the Certificate {{ fqdn }}"
+        additional_comments: "Ansible Automation - Created the Certificate {{ fqdn }}"
+        state: 3
+    run_once: true
+    delegate_to: localhost
+    when: (com_challenge is changed)  and (snow_item is defined)  
+
+    #------------------------------------------------------------------------------
+    #----  Closes the ServiceNow request after successful certificate creation.
+    #------------------------------------------------------------------------------
+  - name: close servicenow request
+    snow_record:
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      instance: "{{ sn_instance }}"
+      state: present
+      table: sc_request
+      number: "{{ snow_request }}"
+      data:
+        work_notes: "Ansible Automation - Created the Certificate {{ fqdn }}"
+        additional_comments: "Ansible Automation - Created the Certificate {{ fqdn }}"
+        state: 3
+    run_once: true
+    delegate_to: localhost
+    when: (com_challenge is changed)  and (snow_request is defined)
