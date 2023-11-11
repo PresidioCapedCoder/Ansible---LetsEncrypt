@@ -29,8 +29,8 @@ Follow the Official [AWX Oerator installation Guide](https://github.com/ansible/
 Clone this repository to your control node:
 
 ```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
+git clone github.com/PresidioCapedCoder/LetsEncrypt-Automation.git
+cd LetsEncrypt-Automation
 ```
 
 ### Installing Required Collections
